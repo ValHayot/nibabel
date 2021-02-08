@@ -4,9 +4,14 @@
 
 import os
 import glob
+import s3fs
+import psutil
 import struct
 import string
 import warnings
+import threading
+from copy import deepcopy
+from shutil import disk_usage
 
 import numpy as np
 from numpy.compat.py3k import asstr
@@ -24,6 +29,66 @@ from .tractogram import TractogramItem, Tractogram, LazyTractogram
 from .header import Field
 from .utils import peek_next
 from .trk import *
+
+
+def has_handle(fn):
+    for proc in psutil.process_iter():
+        try:
+            for item in proc.open_files():
+                if fn in item.path:
+                    return True
+        except Exception:
+            pass
+    return False
+
+
+# NOTE: Need to pass s3fs conditions over so that they can be used here
+def rolling_prefetch(filename, caches, block_size=43036684):
+    fn_prefix = os.path.basename(filename)
+
+    # Loop until all data has been read
+    while True:
+        filenames = sorted(get_cached(fn_prefix, caches))
+
+        fs = s3fs.S3FileSystem()
+        offset = 0
+
+        # only remove files if we know that a cached file is in use
+        # NOTE: might not work in many cases resulting in overfilling the cache
+        # will need to find a solution where we know the offset being accessed
+        if len(filenames) > 0:
+            for idx, fn in enumerate(filenames):
+                if has_handle(fn):
+                    for path in filenames[0:idx]:
+                        os.remove(path)
+
+        # NOTE: will use a bit of memory to read/write file. Need to warn user
+        # Prefetch to cache
+        for path,space in caches.items():
+            
+            space *= 1024**2 # convert to bytes from megabytes
+            avail_cache = disk_usage(path).free - space
+
+            while avail_cache >= block_size:
+                try:
+
+                    data = fs.read_block(filename, offset, block_size)
+
+                    if len(data) == 0 :
+                        return
+
+                    # only write to final path when data copy is complete
+                    tmp_path = os.path.join(path, f".{fn_prefix}.{offset}.tmp")
+                    final_path = os.path.join(path, f"{fn_prefix}.{offset}")
+                    with open(tmp_path, "wb") as f:
+                        f.write(data)
+                    os.rename(tmp_path, final_path)
+                    offset += block_size
+                    avail_cache = disk_usage(path).free - space
+
+                except Exception as e:
+                    # Assuming file has finished being read here
+                    return
 
 
 class S3TrkFile(TrkFile):
@@ -121,6 +186,9 @@ class S3TrkFile(TrkFile):
         cls.caches = caches
         hdr = cls._read_header(fileobj, cls.caches)
 
+        # create rolling prefetch thread
+        t = threading.Thread(target=rolling_prefetch, args=(fileobj.path, deepcopy(caches)))
+        t.start()
         # Find scalars and properties name
         data_per_point_slice = {}
         if hdr[Field.NB_SCALARS_PER_POINT] > 0:
@@ -359,10 +427,6 @@ class S3TrkFile(TrkFile):
 
                 yield points, scalars, properties
                 count += 1
-
-                if count == 3:
-                    import sys
-                    sys.exit(1)
 
             # In case the 'count' field was not provided.
             header[Field.NB_STREAMLINES] = count
