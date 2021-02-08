@@ -5,13 +5,13 @@
 import os
 import glob
 import s3fs
-import psutil
 import struct
 import string
 import warnings
 import threading
 from copy import deepcopy
 from shutil import disk_usage
+from pathlib import Path
 
 import numpy as np
 from numpy.compat.py3k import asstr
@@ -31,36 +31,18 @@ from .utils import peek_next
 from .trk import *
 
 
-def has_handle(fn):
-    for proc in psutil.process_iter():
-        try:
-            for item in proc.open_files():
-                if fn in item.path:
-                    return True
-        except Exception:
-            pass
-    return False
-
-
 # NOTE: Need to pass s3fs conditions over so that they can be used here
 def rolling_prefetch(filename, caches, block_size=43036684):
     fn_prefix = os.path.basename(filename)
+    fs = s3fs.S3FileSystem()
+    offset = 0
 
     # Loop until all data has been read
     while True:
-        filenames = sorted(get_cached(fn_prefix, caches))
-
-        fs = s3fs.S3FileSystem()
-        offset = 0
-
-        # only remove files if we know that a cached file is in use
-        # NOTE: might not work in many cases resulting in overfilling the cache
-        # will need to find a solution where we know the offset being accessed
-        if len(filenames) > 0:
-            for idx, fn in enumerate(filenames):
-                if has_handle(fn):
-                    for path in filenames[0:idx]:
-                        os.remove(path)
+        # remove files flagged for deletion
+        for c in caches.keys():
+            for p in Path(c).glob("*.nibtodelete"):
+                p.unlink()
 
         # NOTE: will use a bit of memory to read/write file. Need to warn user
         # Prefetch to cache
@@ -74,6 +56,7 @@ def rolling_prefetch(filename, caches, block_size=43036684):
 
                     data = fs.read_block(filename, offset, block_size)
 
+                    # if offsethas exceed available data
                     if len(data) == 0 :
                         return
 
@@ -89,6 +72,10 @@ def rolling_prefetch(filename, caches, block_size=43036684):
                 except Exception as e:
                     # Assuming file has finished being read here
                     return
+
+        if fs.du(filename) <= offset:
+            return
+
 
 
 class S3TrkFile(TrkFile):
@@ -183,6 +170,7 @@ class S3TrkFile(TrkFile):
         and *mm* space where coordinate (0,0,0) refers to the center of the
         voxel.
         """
+        #TODO: remove
         cls.caches = caches
         hdr = cls._read_header(fileobj, cls.caches)
 
@@ -457,9 +445,13 @@ def cached_read(f, cf_, nbytes, fidx, fn_prefix, caches):
     offset = fidx[1]
 
     is_cached = True
+    path = cf_.name
     while remainder_bytes > 0:
+        cf_.close()
         fns = get_cached(fn_prefix, caches)
         is_cached, cf_, offset, fidx = get_updated_offset(fns, offset)
+
+        path = cf_.name
 
         if is_cached:
             cf_.seek(offset, os.SEEK_SET)
@@ -479,6 +471,7 @@ def cached_read(f, cf_, nbytes, fidx, fn_prefix, caches):
 
         if remainder_bytes > 0 and cf_ is not None:
             cf_.close()
+            os.rename(path, f"{path}.nibtodelete")
 
     return is_cached, data, cf_, fidx
 
