@@ -32,33 +32,35 @@ from .trk import *
 
 
 # NOTE: Need to pass s3fs conditions over so that they can be used here
-def rolling_prefetch(filename, caches, block_size=43036684):
+@profile
+def rolling_prefetch(filename, caches, block_size=2*1024**2):#43036684):
     fn_prefix = os.path.basename(filename)
     fs = s3fs.S3FileSystem()
-    offset = 0
 
-    # Loop until all data has been read
-    while True:
-        # remove files flagged for deletion
-        for c in caches.keys():
-            for p in Path(c).glob("*.nibtodelete"):
-                p.unlink()
+    # try / except as filesystem may be closed by read thread
+    try:
+        total_bytes = fs.du(filename)
+        offset = 0
 
-        # NOTE: will use a bit of memory to read/write file. Need to warn user
-        # Prefetch to cache
-        for path,space in caches.items():
-            
-            space *= 1024**2 # convert to bytes from megabytes
-            avail_cache = disk_usage(path).free - space
+        prefetch = True
 
-            while avail_cache >= block_size:
-                try:
+        # Loop until all data has been read
+        while prefetch:
+            # remove files flagged for deletion
+            for c in caches.keys():
+                for p in Path(c).glob("*.nibtodelete"):
+                    p.unlink()
+
+            # NOTE: will use a bit of memory to read/write file. Need to warn user
+            # Prefetch to cache
+            for path,space in caches.items():
+                
+                space *= 1024**2 # convert to bytes from megabytes
+                avail_cache = min(disk_usage(path).free, space)
+
+                while avail_cache >= block_size and total_bytes > offset:
 
                     data = fs.read_block(filename, offset, block_size)
-
-                    # if offsethas exceed available data
-                    if len(data) == 0 :
-                        return
 
                     # only write to final path when data copy is complete
                     tmp_path = os.path.join(path, f".{fn_prefix}.{offset}.tmp")
@@ -69,12 +71,11 @@ def rolling_prefetch(filename, caches, block_size=43036684):
                     offset += block_size
                     avail_cache = disk_usage(path).free - space
 
-                except Exception as e:
-                    # Assuming file has finished being read here
-                    return
-
-        if fs.du(filename) <= offset:
-            return
+                if total_bytes <= offset:
+                    prefetch = False
+                    break
+    except:
+        pass
 
 
 
@@ -144,6 +145,7 @@ class S3TrkFile(TrkFile):
 
 
     @classmethod
+    @profile
     def load(cls, fileobj, lazy_load=False, caches={ "/dev/shm": 7*1024 }):
         """ Loads streamlines from a filename or file-like object.
 
@@ -318,6 +320,7 @@ class S3TrkFile(TrkFile):
         return header
 
     @staticmethod
+    @profile
     def _read(fileobj, header, caches=None):
         """ Return generator that reads TRK data from `fileobj` given `header`
 
@@ -423,12 +426,15 @@ class S3TrkFile(TrkFile):
             f.seek(start_position, os.SEEK_CUR)
 
 
+@profile
 def get_cached(fn_prefix, caches):
     return [fn for fs in caches.keys() for fn in glob.glob(os.path.join(fs, f"{fn_prefix}.*"))]
 
+@profile
 def get_cached_idx(fns):
     return {(int(fn.split('.')[-1]), int(fn.split('.')[-1]) + os.stat(fn).st_size) : fn for fn in fns}
 
+@profile
 def get_updated_offset(fns, offset):
     cidx = get_cached_idx(fns) 
 
@@ -438,6 +444,7 @@ def get_updated_offset(fns, offset):
 
     return False, None, offset, None
 
+@profile
 def cached_read(f, cf_, nbytes, fidx, fn_prefix, caches):
     b_remaining = fidx[1] - fidx[0] - cf_.tell()
     remainder_bytes = max(nbytes - b_remaining, 0)
