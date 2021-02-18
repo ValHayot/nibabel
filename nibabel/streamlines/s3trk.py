@@ -32,8 +32,8 @@ from .trk import *
 
 
 # NOTE: Need to pass s3fs conditions over so that they can be used here
-@profile
-def rolling_prefetch(filename, caches, block_size=2*1024**2):#43036684):
+#@profile
+def rolling_prefetch(filename, caches, block_size=32*1024**2):#43036684):
     fn_prefix = os.path.basename(filename)
     fs = s3fs.S3FileSystem()
 
@@ -145,8 +145,8 @@ class S3TrkFile(TrkFile):
 
 
     @classmethod
-    @profile
-    def load(cls, fileobj, lazy_load=False, caches={ "/dev/shm": 7*1024 }):
+    #@profile
+    def load(cls, fileobj, lazy_load=False, caches={ "/home/ec2-user": 7*1024 }):
         """ Loads streamlines from a filename or file-like object.
 
         Parameters
@@ -320,7 +320,7 @@ class S3TrkFile(TrkFile):
         return header
 
     @staticmethod
-    @profile
+    #@profile
     def _read(fileobj, header, caches=None):
         """ Return generator that reads TRK data from `fileobj` given `header`
 
@@ -379,9 +379,14 @@ class S3TrkFile(TrkFile):
             nb_pts_dtype = i4_dtype.str[:-1]
             while count < nb_streamlines:
                 if is_cached:
+                    #print("cf location", cf_.tell())
                     is_cached, nb_pts_str, cf_, fidx  = cached_read(f, cf_, i4_dtype.itemsize, fidx, fn_prefix, caches)
                 else:
                     nb_pts_str = f.read(i4_dtype.itemsize)
+                    fns = get_cached(fn_prefix, caches)
+                    is_cached, cf_, offset_, fidx = get_updated_offset(fns, f.tell())
+                    #print("offset", f.tell(), "cached files", fns)
+
 
                 # Check if we reached EOF
                 if len(nb_pts_str) == 0:
@@ -391,10 +396,15 @@ class S3TrkFile(TrkFile):
                 nb_pts = struct.unpack(nb_pts_dtype, nb_pts_str)[0]
 
                 br = nb_pts * pts_and_scalars_size
+                #print("br", br, nb_pts, pts_and_scalars_size)
                 if is_cached:
+                    #print("cf location", cf_.tell())
                     is_cached, data, cf_, fidx  = cached_read(f, cf_, br, fidx, fn_prefix, caches)
                 else:
                     data = f.read(br)
+                    fns = get_cached(fn_prefix, caches)
+                    is_cached, cf_, offset_, fidx = get_updated_offset(fns, f.tell())
+                    #print("offset", f.tell(), "cached files", fns)
 
                 # Read streamline's data
                 points_and_scalars = np.ndarray(
@@ -406,9 +416,13 @@ class S3TrkFile(TrkFile):
                 scalars = points_and_scalars[:, 3:]
 
                 if is_cached:
+                    #print("cf location", cf_.tell())
                     is_cached, buffer, cf_, fidx  = cached_read(f, cf_, properties_size, fidx, fn_prefix, caches)
                 else:
                     buffer = f.read(properties_size)
+                    fns = get_cached(fn_prefix, caches)
+                    is_cached, cf_, offset_, fidx = get_updated_offset(fns, f.tell())
+                    #print("offset", f.tell(), "cached files", fns)
 
                 # Read properties
                 properties = np.ndarray(
@@ -426,59 +440,79 @@ class S3TrkFile(TrkFile):
             f.seek(start_position, os.SEEK_CUR)
 
 
-@profile
+#@profile
 def get_cached(fn_prefix, caches):
     return [fn for fs in caches.keys() for fn in glob.glob(os.path.join(fs, f"{fn_prefix}.*"))]
 
-@profile
+#@profile
 def get_cached_idx(fns):
     return {(int(fn.split('.')[-1]), int(fn.split('.')[-1]) + os.stat(fn).st_size) : fn for fn in fns}
 
-@profile
+#@profile
 def get_updated_offset(fns, offset):
     cidx = get_cached_idx(fns) 
 
     for k,v in cidx.items():
         if offset >= k[0] and offset < k[1]:
-            return True, open(v, "rb"), offset - k[0], k
+            cf_ = open(v, "rb")
+            c_offset = offset - k[0]
+            cf_.seek(c_offset)
+            return True, cf_, c_offset, k
 
     return False, None, offset, None
 
-@profile
+#@profile
 def cached_read(f, cf_, nbytes, fidx, fn_prefix, caches):
+
     b_remaining = fidx[1] - fidx[0] - cf_.tell()
+
+    if b_remaining < 0 :
+        b_remaining = 0
+
+    #print("in cached_read", nbytes, b_remaining, fidx[1], fidx[0], cf_.tell())
     remainder_bytes = max(nbytes - b_remaining, 0)
-    data = cf_.read(min([nbytes, b_remaining]))
+    data = cf_.read(max(min([nbytes, b_remaining]), 0))
     offset = fidx[1]
 
     is_cached = True
-    path = cf_.name
+    #print("remainder", remainder_bytes)
+
     while remainder_bytes > 0:
+        #print("while")
         cf_.close()
         fns = get_cached(fn_prefix, caches)
         is_cached, cf_, offset, fidx = get_updated_offset(fns, offset)
 
-        path = cf_.name
 
         if is_cached:
+            #print("is cached")
+            path = cf_.name
             cf_.seek(offset, os.SEEK_SET)
             b_remaining = fidx[1] - fidx[0] - cf_.tell()
             nbytes = remainder_bytes
             remainder_bytes = max(nbytes - b_remaining, 0)
             data += cf_.read(min(nbytes, b_remaining))
             offset = cf_.tell() + fidx[0]
+            f.seek(offset, os.SEEK_SET)
         else:
+            #print("not cached")
             f.seek(offset, os.SEEK_SET)
             # assumes all data can just be read from long term storage
             data += f.read(remainder_bytes)
+            #print("is not cached", nbytes, remainder_bytes, len(data))
             remainder_bytes = 0
             is_cached = False
             cf_ = None
             fidx = None
+            #print("done reading from s3")
 
         if remainder_bytes > 0 and cf_ is not None:
             cf_.close()
             os.rename(path, f"{path}.nibtodelete")
+    else:
+        if cf_ is not None:
+            f.seek(fidx[0] + cf_.tell(), os.SEEK_SET)
+
 
     return is_cached, data, cf_, fidx
 
