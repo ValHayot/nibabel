@@ -22,6 +22,8 @@ from nibabel.openers import Opener
 from nibabel.volumeutils import (native_code, swapped_code, endian_codes)
 from nibabel.orientations import (aff2axcodes, axcodes2ornt)
 
+import .rolling_prefetch as rp
+
 from .array_sequence import create_arraysequences_from_generator
 from .tractogram_file import TractogramFile
 from .tractogram_file import DataError, HeaderError, HeaderWarning
@@ -30,52 +32,6 @@ from .header import Field
 from .utils import peek_next
 from .trk import *
 
-
-# NOTE: Need to pass s3fs conditions over so that they can be used here
-#@profile
-def rolling_prefetch(filename, caches, block_size=32*1024**2):#43036684):
-    fn_prefix = os.path.basename(filename)
-    fs = s3fs.S3FileSystem()
-
-    # try / except as filesystem may be closed by read thread
-    try:
-        total_bytes = fs.du(filename)
-        offset = 0
-
-        prefetch = True
-
-        # Loop until all data has been read
-        while prefetch:
-            # remove files flagged for deletion
-            for c in caches.keys():
-                for p in Path(c).glob("*.nibtodelete"):
-                    p.unlink()
-
-            # NOTE: will use a bit of memory to read/write file. Need to warn user
-            # Prefetch to cache
-            for path,space in caches.items():
-                
-                space *= 1024**2 # convert to bytes from megabytes
-                avail_cache = min(disk_usage(path).free, space)
-
-                while avail_cache >= block_size and total_bytes > offset:
-
-                    data = fs.read_block(filename, offset, block_size)
-
-                    # only write to final path when data copy is complete
-                    tmp_path = os.path.join(path, f".{fn_prefix}.{offset}.tmp")
-                    final_path = os.path.join(path, f"{fn_prefix}.{offset}")
-                    with open(tmp_path, "wb") as f:
-                        f.write(data)
-                    os.rename(tmp_path, final_path)
-                    offset += block_size
-                    avail_cache = disk_usage(path).free - space
-
-                if total_bytes <= offset:
-                    prefetch = False
-                    break
-    except:
-        pass
 
 
 
@@ -174,10 +130,10 @@ class S3TrkFile(TrkFile):
         """
         #TODO: remove
         cls.caches = caches
-        hdr = cls._read_header(fileobj, cls.caches)
+        hdr = cls._read_header(fileobj)
 
         # create rolling prefetch thread
-        t = threading.Thread(target=rolling_prefetch, args=(fileobj.path, deepcopy(caches)))
+        t = threading.Thread(target=rp.rolling_prefetch, args=(fileobj.path, deepcopy(caches)))
         t.start()
         # Find scalars and properties name
         data_per_point_slice = {}
@@ -233,92 +189,6 @@ class S3TrkFile(TrkFile):
         return cls(tractogram, header=hdr)
 
 
-
-
-    @staticmethod
-    def _read_header(fileobj, caches):
-        """ Reads a TRK header from a file.
-
-        Parameters
-        ----------
-        fileobj : string or file-like object
-            If string, a filename; otherwise an open file-like object
-            pointing to TRK file (and ready to read from the beginning
-            of the TRK header). Note that calling this function
-            does not change the file position.
-
-        Returns
-        -------
-        header : dict
-            Metadata associated with this tractogram file.
-        """
-        # Record start position if this is a file-like object
-        start_position = fileobj.tell() if hasattr(fileobj, 'tell') else None
-
-        with Opener(fileobj) as f:
-            # Reading directly from a file into a (mutable) bytearray enables a zero-copy
-            # cast to a mutable numpy object with frombuffer
-            header_buf = bytearray(header_2_dtype.itemsize)
-            f.readinto(header_buf)
-            header_rec = np.frombuffer(buffer=header_buf, dtype=header_2_dtype)
-            # Check endianness
-            endianness = native_code
-            if header_rec['hdr_size'] != TrkFile.HEADER_SIZE:
-                endianness = swapped_code
-
-                # Swap byte order
-                header_rec = header_rec.newbyteorder()
-                if header_rec['hdr_size'] != TrkFile.HEADER_SIZE:
-                    msg = (f"Invalid hdr_size: {header_rec['hdr_size']} "
-                           f"instead of {TrkFile.HEADER_SIZE}")
-                    raise HeaderError(msg)
-
-            if header_rec['version'] == 1:
-                # There is no 4x4 matrix for voxel to RAS transformation.
-                header_rec[Field.VOXEL_TO_RASMM] = np.zeros((4, 4))
-            elif header_rec['version'] == 2:
-                pass  # Nothing more to do.
-            else:
-                raise HeaderError('NiBabel only supports versions 1 and 2 of '
-                                  'the Trackvis file format')
-
-            # Convert the first record of `header_rec` into a dictionnary
-            header = dict(zip(header_rec.dtype.names, header_rec[0]))
-            header[Field.ENDIANNESS] = endianness
-
-            # If vox_to_ras[3][3] is 0, it means the matrix is not recorded.
-            if header[Field.VOXEL_TO_RASMM][3][3] == 0:
-                header[Field.VOXEL_TO_RASMM] = np.eye(4, dtype=np.float32)
-                warnings.warn(("Field 'vox_to_ras' in the TRK's header was"
-                               " not recorded. Will continue assuming it's"
-                               " the identity."), HeaderWarning)
-
-            # Check that the 'vox_to_ras' affine is valid, i.e. should be
-            # able to determine the axis directions.
-            axcodes = aff2axcodes(header[Field.VOXEL_TO_RASMM])
-            if None in axcodes:
-                msg = ("The 'vox_to_ras' affine is invalid! Could not"
-                       " determine the axis directions from it.\n"
-                       f"{header[Field.VOXEL_TO_RASMM]}")
-                raise HeaderError(msg)
-
-            # By default, the voxel order is LPS.
-            # http://trackvis.org/blog/forum/diffusion-toolkit-usage/interpretation-of-track-point-coordinates
-            if header[Field.VOXEL_ORDER] == b"":
-                msg = ("Voxel order is not specified, will assume 'LPS' since"
-                       " it is Trackvis software's default.")
-                warnings.warn(msg, HeaderWarning)
-                header[Field.VOXEL_ORDER] = b"LPS"
-
-            # Keep the file position where the data begin.
-            header['_offset_data'] = f.tell()
-
-        # Set the file position where it was, if it was previously open.
-        if start_position is not None:
-            fileobj.seek(start_position, os.SEEK_SET)
-
-        return header
-
     @staticmethod
     #@profile
     def _read(fileobj, header, caches=None):
@@ -359,14 +229,10 @@ class S3TrkFile(TrkFile):
             properties_size = int(nb_properties * f4_dtype.itemsize)
 
             fn_prefix = os.path.basename(fileobj.path)
-            fns = get_cached(fn_prefix, caches)
-            
-            is_cached, cf_, offset_, fidx = get_updated_offset(fns, header["_offset_data"])
+            is_cached, cf_, fidx = rp.get_block(fn_prefix, caches, header["_offset_data"])
 
             # Set the file position at the beginning of the data.
-            if is_cached:
-                cf_.seek(offset_, os.SEEK_SET)
-            else:
+            if not is_cached:
                 f.seek(header["_offset_data"], os.SEEK_SET)
 
             # If 'count' field is 0, i.e. not provided, we have to loop
@@ -379,13 +245,10 @@ class S3TrkFile(TrkFile):
             nb_pts_dtype = i4_dtype.str[:-1]
             while count < nb_streamlines:
                 if is_cached:
-                    #print("cf location", cf_.tell())
-                    is_cached, nb_pts_str, cf_, fidx  = cached_read(f, cf_, i4_dtype.itemsize, fidx, fn_prefix, caches)
+                    is_cached, nb_pts_str, cf_, fidx  = rp.cached_read(f, cf_, i4_dtype.itemsize, fidx, fn_prefix, caches)
                 else:
                     nb_pts_str = f.read(i4_dtype.itemsize)
-                    fns = get_cached(fn_prefix, caches)
-                    is_cached, cf_, offset_, fidx = get_updated_offset(fns, f.tell())
-                    #print("offset", f.tell(), "cached files", fns)
+                    is_cached, cf_, offset_, fidx = rp.get_block(fn_prefix, caches, f.tell())
 
 
                 # Check if we reached EOF
@@ -396,15 +259,11 @@ class S3TrkFile(TrkFile):
                 nb_pts = struct.unpack(nb_pts_dtype, nb_pts_str)[0]
 
                 br = nb_pts * pts_and_scalars_size
-                #print("br", br, nb_pts, pts_and_scalars_size)
                 if is_cached:
-                    #print("cf location", cf_.tell())
-                    is_cached, data, cf_, fidx  = cached_read(f, cf_, br, fidx, fn_prefix, caches)
+                    is_cached, data, cf_, fidx  = rp.cached_read(f, cf_, br, fidx, fn_prefix, caches)
                 else:
                     data = f.read(br)
-                    fns = get_cached(fn_prefix, caches)
-                    is_cached, cf_, offset_, fidx = get_updated_offset(fns, f.tell())
-                    #print("offset", f.tell(), "cached files", fns)
+                    is_cached, cf_, offset_, fidx = rp.get_block(fn_prefix, caches, f.tell())
 
                 # Read streamline's data
                 points_and_scalars = np.ndarray(
@@ -417,18 +276,16 @@ class S3TrkFile(TrkFile):
 
                 if is_cached:
                     #print("cf location", cf_.tell())
-                    is_cached, buffer, cf_, fidx  = cached_read(f, cf_, properties_size, fidx, fn_prefix, caches)
+                    is_cached, data, cf_, fidx  = rp.cached_read(f, cf_, properties_size, fidx, fn_prefix, caches)
                 else:
-                    buffer = f.read(properties_size)
-                    fns = get_cached(fn_prefix, caches)
-                    is_cached, cf_, offset_, fidx = get_updated_offset(fns, f.tell())
-                    #print("offset", f.tell(), "cached files", fns)
+                    data = f.read(properties_size)
+                    is_cached, cf_, offset_, fidx = rp.get_block(fn_prefix, caches, f.tell())
 
                 # Read properties
                 properties = np.ndarray(
                     shape=(nb_properties,),
                     dtype=f4_dtype,
-                    buffer=buffer)
+                    buffer=data)
 
                 yield points, scalars, properties
                 count += 1
@@ -439,80 +296,4 @@ class S3TrkFile(TrkFile):
             # Set the file position where it was (in case it was already open).
             f.seek(start_position, os.SEEK_CUR)
 
-
-#@profile
-def get_cached(fn_prefix, caches):
-    return [fn for fs in caches.keys() for fn in glob.glob(os.path.join(fs, f"{fn_prefix}.*"))]
-
-#@profile
-def get_cached_idx(fns):
-    return {(int(fn.split('.')[-1]), int(fn.split('.')[-1]) + os.stat(fn).st_size) : fn for fn in fns}
-
-#@profile
-def get_updated_offset(fns, offset):
-    cidx = get_cached_idx(fns) 
-
-    for k,v in cidx.items():
-        if offset >= k[0] and offset < k[1]:
-            cf_ = open(v, "rb")
-            c_offset = offset - k[0]
-            cf_.seek(c_offset)
-            return True, cf_, c_offset, k
-
-    return False, None, offset, None
-
-#@profile
-def cached_read(f, cf_, nbytes, fidx, fn_prefix, caches):
-
-    b_remaining = fidx[1] - fidx[0] - cf_.tell()
-
-    if b_remaining < 0 :
-        b_remaining = 0
-
-    #print("in cached_read", nbytes, b_remaining, fidx[1], fidx[0], cf_.tell())
-    remainder_bytes = max(nbytes - b_remaining, 0)
-    data = cf_.read(max(min([nbytes, b_remaining]), 0))
-    offset = fidx[1]
-
-    is_cached = True
-    #print("remainder", remainder_bytes)
-
-    while remainder_bytes > 0:
-        #print("while")
-        cf_.close()
-        fns = get_cached(fn_prefix, caches)
-        is_cached, cf_, offset, fidx = get_updated_offset(fns, offset)
-
-
-        if is_cached:
-            #print("is cached")
-            path = cf_.name
-            cf_.seek(offset, os.SEEK_SET)
-            b_remaining = fidx[1] - fidx[0] - cf_.tell()
-            nbytes = remainder_bytes
-            remainder_bytes = max(nbytes - b_remaining, 0)
-            data += cf_.read(min(nbytes, b_remaining))
-            offset = cf_.tell() + fidx[0]
-            f.seek(offset, os.SEEK_SET)
-        else:
-            #print("not cached")
-            f.seek(offset, os.SEEK_SET)
-            # assumes all data can just be read from long term storage
-            data += f.read(remainder_bytes)
-            #print("is not cached", nbytes, remainder_bytes, len(data))
-            remainder_bytes = 0
-            is_cached = False
-            cf_ = None
-            fidx = None
-            #print("done reading from s3")
-
-        if remainder_bytes > 0 and cf_ is not None:
-            cf_.close()
-            os.rename(path, f"{path}.nibtodelete")
-    else:
-        if cf_ is not None:
-            f.seek(fidx[0] + cf_.tell(), os.SEEK_SET)
-
-
-    return is_cached, data, cf_, fidx
 
