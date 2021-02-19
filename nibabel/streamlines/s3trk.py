@@ -22,7 +22,7 @@ from nibabel.openers import Opener
 from nibabel.volumeutils import (native_code, swapped_code, endian_codes)
 from nibabel.orientations import (aff2axcodes, axcodes2ornt)
 
-import .rolling_prefetch as rp
+from .rolling_prefetch import _prefetch, get_block, cached_read
 
 from .array_sequence import create_arraysequences_from_generator
 from .tractogram_file import TractogramFile
@@ -102,7 +102,7 @@ class S3TrkFile(TrkFile):
 
     @classmethod
     #@profile
-    def load(cls, fileobj, lazy_load=False, caches={ "/home/ec2-user": 7*1024 }):
+    def load(cls, fileobj, lazy_load=False, caches={ "/dev/shm": 7*1024 }):
         """ Loads streamlines from a filename or file-like object.
 
         Parameters
@@ -128,12 +128,10 @@ class S3TrkFile(TrkFile):
         and *mm* space where coordinate (0,0,0) refers to the center of the
         voxel.
         """
-        #TODO: remove
-        cls.caches = caches
         hdr = cls._read_header(fileobj)
 
         # create rolling prefetch thread
-        t = threading.Thread(target=rp.rolling_prefetch, args=(fileobj.path, deepcopy(caches)))
+        t = threading.Thread(target=_prefetch, args=(fileobj.path, deepcopy(caches)))
         t.start()
         # Find scalars and properties name
         data_per_point_slice = {}
@@ -172,7 +170,7 @@ class S3TrkFile(TrkFile):
                 data_per_streamline_slice['properties'] = slice_obj
 
         def _read():
-            for pts, scals, props in cls._read(fileobj, hdr, cls.caches):
+            for pts, scals, props in cls._read(fileobj, hdr, caches):
                 items = data_per_point_slice.items()
                 data_for_points = dict((k, scals[:, v]) for k, v in items)
                 items = data_per_streamline_slice.items()
@@ -229,7 +227,7 @@ class S3TrkFile(TrkFile):
             properties_size = int(nb_properties * f4_dtype.itemsize)
 
             fn_prefix = os.path.basename(fileobj.path)
-            is_cached, cf_, fidx = rp.get_block(fn_prefix, caches, header["_offset_data"])
+            is_cached, cf_, fidx = get_block(fn_prefix, caches, header["_offset_data"])
 
             # Set the file position at the beginning of the data.
             if not is_cached:
@@ -245,10 +243,10 @@ class S3TrkFile(TrkFile):
             nb_pts_dtype = i4_dtype.str[:-1]
             while count < nb_streamlines:
                 if is_cached:
-                    is_cached, nb_pts_str, cf_, fidx  = rp.cached_read(f, cf_, i4_dtype.itemsize, fidx, fn_prefix, caches)
+                    is_cached, nb_pts_str, cf_, fidx  = cached_read(f, cf_, i4_dtype.itemsize, fidx, fn_prefix, caches)
                 else:
                     nb_pts_str = f.read(i4_dtype.itemsize)
-                    is_cached, cf_, offset_, fidx = rp.get_block(fn_prefix, caches, f.tell())
+                    is_cached, cf_, fidx = get_block(fn_prefix, caches, f.tell())
 
 
                 # Check if we reached EOF
@@ -260,10 +258,10 @@ class S3TrkFile(TrkFile):
 
                 br = nb_pts * pts_and_scalars_size
                 if is_cached:
-                    is_cached, data, cf_, fidx  = rp.cached_read(f, cf_, br, fidx, fn_prefix, caches)
+                    is_cached, data, cf_, fidx  = cached_read(f, cf_, br, fidx, fn_prefix, caches)
                 else:
                     data = f.read(br)
-                    is_cached, cf_, offset_, fidx = rp.get_block(fn_prefix, caches, f.tell())
+                    is_cached, cf_, fidx = get_block(fn_prefix, caches, f.tell())
 
                 # Read streamline's data
                 points_and_scalars = np.ndarray(
@@ -276,10 +274,10 @@ class S3TrkFile(TrkFile):
 
                 if is_cached:
                     #print("cf location", cf_.tell())
-                    is_cached, data, cf_, fidx  = rp.cached_read(f, cf_, properties_size, fidx, fn_prefix, caches)
+                    is_cached, data, cf_, fidx  = cached_read(f, cf_, properties_size, fidx, fn_prefix, caches)
                 else:
                     data = f.read(properties_size)
-                    is_cached, cf_, offset_, fidx = rp.get_block(fn_prefix, caches, f.tell())
+                    is_cached, cf_, fidx = get_block(fn_prefix, caches, f.tell())
 
                 # Read properties
                 properties = np.ndarray(

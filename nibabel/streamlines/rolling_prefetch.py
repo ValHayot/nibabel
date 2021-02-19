@@ -9,9 +9,13 @@ from shutil import disk_usage
 from pathlib import Path
 
 # NOTE: Need to pass s3fs conditions over so that they can be used here
+
+# extension of files flagged for deletion
+DELETE_STR = ".nibtodelete"
+
 # @profile
 def _prefetch(
-    filename, caches, block_size=32 * 1024 ** 2, delete_rgx="*.nibtodelete", **s3_kwargs
+    filename, caches, block_size=32*1024**2, **s3_kwargs
 ):
     """Concurrently fetch data from S3 in blocks and store in cache
 
@@ -23,8 +27,6 @@ def _prefetch(
         Dictionary containing cache paths as keys and available space (in MB) as values
     block_size: int
         Number of bytes to prefect at a time (default: 32MB)
-    delete_rgx: str
-        Regex pattern to determine which files need to be evicted from cache (default *.nibtodelete)
     s3_kwargs: kwargs
         Keyword arguments to pass to s3fs object
 
@@ -43,7 +45,7 @@ def _prefetch(
         while fetch:
             # remove files flagged for deletion
             for c in caches.keys():
-                for p in Path(c).glob(delete_rgx):
+                for p in Path(c).glob(f"*{DELETE_STR}"):
                     p.unlink()
 
             # NOTE: will use a bit of memory to read/write file. Need to warn user
@@ -60,8 +62,10 @@ def _prefetch(
                     # only write to final path when data copy is complete
                     tmp_path = os.path.join(path, f".{fn_prefix}.{offset}.tmp")
                     final_path = os.path.join(path, f"{fn_prefix}.{offset}")
+
                     with open(tmp_path, "wb") as f:
                         f.write(data)
+
                     os.rename(tmp_path, final_path)
                     offset += block_size
                     avail_cache = disk_usage(path).free - space
@@ -100,7 +104,8 @@ def get_block(fn_prefix, caches, offset):
     cached_files = [
         fn
         for fs in caches.keys()
-        for fn in glob.glob(os.path.join(fs, f"{fn_prefix}.*"))
+        for fn in glob.glob(os.path.join(fs, f"{fn_prefix}.[0-9]*"))
+        if DELETE_STR not in fn
     ]
 
     # Iterate through the cached files/offsets
@@ -120,7 +125,7 @@ def get_block(fn_prefix, caches, offset):
 
 
 # @profile
-def cached_read(f, cf_, nbytes, fidx, fn_prefix, caches, delete_str=".nibtodelete"):
+def cached_read(f, cf_, nbytes, fidx, fn_prefix, caches):
     """Read necessary bytes from cached blocks. If remainder of data is not in cache, read from original
     location.
 
@@ -138,8 +143,6 @@ def cached_read(f, cf_, nbytes, fidx, fn_prefix, caches, delete_str=".nibtodelet
         The original file basename
     caches : dict
         Dictionary containing cache paths as keys and available space (in MB) as values
-    delete_str: str (Default: ".nibtodelete")
-        String postfix that flags filepaths for deletion
 
     Returns
     -------
@@ -171,7 +174,7 @@ def cached_read(f, cf_, nbytes, fidx, fn_prefix, caches, delete_str=".nibtodelet
     while remainder_bytes > 0:
 
         # flag previous cached file for deletion and close it
-        os.rename(path, f"{path}{delete_str}")
+        os.rename(cf_.name, f"{cf_.name}{DELETE_STR}")
         cf_.close()
 
         # check to see if offset is in cache
@@ -179,7 +182,6 @@ def cached_read(f, cf_, nbytes, fidx, fn_prefix, caches, delete_str=".nibtodelet
 
         # read remaining from cached blocks, if possible
         if is_cached:
-            path = cf_.name
             b_remaining = fidx[1] - fidx[0] - cf_.tell()
             nbytes = remainder_bytes
             remainder_bytes = max(nbytes - b_remaining, 0)
