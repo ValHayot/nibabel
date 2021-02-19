@@ -14,8 +14,8 @@ from pathlib import Path
 DELETE_STR = ".nibtodelete"
 
 # @profile
-def _prefetch(
-    filename, caches, block_size=32*1024**2, **s3_kwargs
+def prefetch(
+    filename, caches, block_size=64*1024**2, **s3_kwargs
 ):
     """Concurrently fetch data from S3 in blocks and store in cache
 
@@ -93,8 +93,6 @@ def get_block(fn_prefix, caches, offset):
 
     Returns
     -------
-    is_cached : bool
-        Boolean denoting whether offset location exists within a cached file
     cf_ : fileobj
         Fileobj of the cached file (returns None if it does not exist)
     k : tuple (int, int)
@@ -119,13 +117,13 @@ def get_block(fn_prefix, caches, offset):
             cf_ = open(f, "rb")
             c_offset = offset - b_start
             cf_.seek(c_offset, os.SEEK_SET)
-            return True, cf_, (b_start, b_end)
+            return cf_, (b_start, b_end)
 
-    return False, None, None
+    return None, None
 
 
 # @profile
-def cached_read(f, cf_, nbytes, fidx, fn_prefix, caches):
+def cached_read(f, nbytes, fn_prefix, caches, cf_, fidx):
     """Read necessary bytes from cached blocks. If remainder of data is not in cache, read from original
     location.
 
@@ -133,21 +131,19 @@ def cached_read(f, cf_, nbytes, fidx, fn_prefix, caches):
     ----------
     f : fileobj
         The original file fileobj
-    cf_: fileobj
-        The fileobj corresponding to the cached file
     nbytes: int
         The number of bytes needed to be read
-    fidx: tuple (int, int)
-        The start and end index of the cached file
+    cf_: fileobj
+        The fileobj corresponding to the cached file
     fn_prefix: str
         The original file basename
+    fidx: tuple (int, int)
+        The start and end index of the cached file
     caches : dict
         Dictionary containing cache paths as keys and available space (in MB) as values
 
     Returns
     -------
-    is_cached : bool
-        Boolean denoting whether offset location exists within a cached file
     data: bytestring
         The total read data of size nbytes
     cf_ : fileobj
@@ -165,8 +161,6 @@ def cached_read(f, cf_, nbytes, fidx, fn_prefix, caches):
     # read necessary bytes provided they're available
     data = cf_.read(max(min([nbytes, b_remaining]), 0))
 
-    is_cached = True
-
     # update global offset to point to next byte
     offset = cf_.tell() + fidx[0]
 
@@ -178,10 +172,10 @@ def cached_read(f, cf_, nbytes, fidx, fn_prefix, caches):
         cf_.close()
 
         # check to see if offset is in cache
-        is_cached, cf_, fidx = get_block(fn_prefix, caches, offset)
+        cf_, fidx = get_block(fn_prefix, caches, offset)
 
         # read remaining from cached blocks, if possible
-        if is_cached:
+        if cf_ is not None:
             b_remaining = fidx[1] - fidx[0] - cf_.tell()
             nbytes = remainder_bytes
             remainder_bytes = max(nbytes - b_remaining, 0)
@@ -204,4 +198,41 @@ def cached_read(f, cf_, nbytes, fidx, fn_prefix, caches):
         if cf_ is not None:
             f.seek(offset, os.SEEK_SET)
 
-    return is_cached, data, cf_, fidx
+    return data, cf_, fidx
+
+def pf_read(f, nbytes, fn_prefix, caches={}, cf_=None, fidx=None):
+    """Determine whether to read bytes from cache or original file
+
+    Parameters
+    ----------
+    f : fileobj
+        The original file fileobj
+    nbytes: int
+        The number of bytes needed to be read
+    fn_prefix: str
+        The original file basename
+    caches : dict
+        Dictionary containing cache paths as keys and available space (in MB) as values
+    cf_: fileobj
+        The fileobj corresponding to the cached file
+    fidx: tuple (int, int)
+        The start and end index of the cached file
+
+    Returns
+    -------
+    data: bytestring
+        The total read data of size nbytes
+    cf_ : fileobj
+        Fileobj of the cached file (returns None if it does not exist)
+    fidx: tuple (int, int)
+        The start and end index of the cached file
+    """
+
+    if cf_ is not None:
+        data, cf_, fidx = cached_read(f, nbytes, fn_prefix, caches, cf_, fidx)
+    else:
+        data = f.read(nbytes)
+        get_block(fn_prefix, caches, f.tell())
+
+    return data, cf_, fidx
+

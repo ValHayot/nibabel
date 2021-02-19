@@ -10,8 +10,6 @@ import string
 import warnings
 import threading
 from copy import deepcopy
-from shutil import disk_usage
-from pathlib import Path
 
 import numpy as np
 from numpy.compat.py3k import asstr
@@ -22,7 +20,7 @@ from nibabel.openers import Opener
 from nibabel.volumeutils import (native_code, swapped_code, endian_codes)
 from nibabel.orientations import (aff2axcodes, axcodes2ornt)
 
-from .rolling_prefetch import _prefetch, get_block, cached_read
+from .rolling_prefetch import prefetch, get_block, cached_read, pf_read
 
 from .array_sequence import create_arraysequences_from_generator
 from .tractogram_file import TractogramFile
@@ -55,7 +53,7 @@ class S3TrkFile(TrkFile):
     SUPPORTS_DATA_PER_POINT = True
     SUPPORTS_DATA_PER_STREAMLINE = True
 
-    def __init__(self, tractogram, header=None, caches={ "/dev/shm": 7*1024 }):
+    def __init__(self, tractogram, header=None):
         """
         Parameters
         ----------
@@ -72,7 +70,6 @@ class S3TrkFile(TrkFile):
         of the voxel.
         """
 
-        self.caches = caches
         super(S3TrkFile, self).__init__(tractogram, header)
 
     @classmethod
@@ -131,7 +128,7 @@ class S3TrkFile(TrkFile):
         hdr = cls._read_header(fileobj)
 
         # create rolling prefetch thread
-        t = threading.Thread(target=_prefetch, args=(fileobj.path, deepcopy(caches)))
+        t = threading.Thread(target=prefetch, args=(fileobj.path, deepcopy(caches)))
         t.start()
         # Find scalars and properties name
         data_per_point_slice = {}
@@ -227,10 +224,10 @@ class S3TrkFile(TrkFile):
             properties_size = int(nb_properties * f4_dtype.itemsize)
 
             fn_prefix = os.path.basename(fileobj.path)
-            is_cached, cf_, fidx = get_block(fn_prefix, caches, header["_offset_data"])
+            cf_, fidx = get_block(fn_prefix, caches, header["_offset_data"])
 
             # Set the file position at the beginning of the data.
-            if not is_cached:
+            if cf_ is None:
                 f.seek(header["_offset_data"], os.SEEK_SET)
 
             # If 'count' field is 0, i.e. not provided, we have to loop
@@ -242,12 +239,8 @@ class S3TrkFile(TrkFile):
             count = 0
             nb_pts_dtype = i4_dtype.str[:-1]
             while count < nb_streamlines:
-                if is_cached:
-                    is_cached, nb_pts_str, cf_, fidx  = cached_read(f, cf_, i4_dtype.itemsize, fidx, fn_prefix, caches)
-                else:
-                    nb_pts_str = f.read(i4_dtype.itemsize)
-                    is_cached, cf_, fidx = get_block(fn_prefix, caches, f.tell())
 
+                nb_pts_str, cf_, fidx = pf_read(f, i4_dtype.itemsize, fn_prefix, caches, cf_, fidx)
 
                 # Check if we reached EOF
                 if len(nb_pts_str) == 0:
@@ -257,11 +250,8 @@ class S3TrkFile(TrkFile):
                 nb_pts = struct.unpack(nb_pts_dtype, nb_pts_str)[0]
 
                 br = nb_pts * pts_and_scalars_size
-                if is_cached:
-                    is_cached, data, cf_, fidx  = cached_read(f, cf_, br, fidx, fn_prefix, caches)
-                else:
-                    data = f.read(br)
-                    is_cached, cf_, fidx = get_block(fn_prefix, caches, f.tell())
+
+                data, cf_, fidx = pf_read(f, br, fn_prefix, caches, cf_, fidx)
 
                 # Read streamline's data
                 points_and_scalars = np.ndarray(
@@ -272,12 +262,7 @@ class S3TrkFile(TrkFile):
                 points = points_and_scalars[:, :3]
                 scalars = points_and_scalars[:, 3:]
 
-                if is_cached:
-                    #print("cf location", cf_.tell())
-                    is_cached, data, cf_, fidx  = cached_read(f, cf_, properties_size, fidx, fn_prefix, caches)
-                else:
-                    data = f.read(properties_size)
-                    is_cached, cf_, fidx = get_block(fn_prefix, caches, f.tell())
+                data, cf_, fidx = pf_read(f, properties_size, fn_prefix, caches, cf_, fidx)
 
                 # Read properties
                 properties = np.ndarray(
