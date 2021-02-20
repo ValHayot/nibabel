@@ -13,9 +13,9 @@ from pathlib import Path
 # extension of files flagged for deletion
 DELETE_STR = ".nibtodelete"
 
-# @profile
+#@profile
 def prefetch(
-    filename, caches, block_size=64*1024**2, **s3_kwargs
+    filename, caches, block_size=32*1024**2, **s3_kwargs
 ):
     """Concurrently fetch data from S3 in blocks and store in cache
 
@@ -78,7 +78,7 @@ def prefetch(
         pass
 
 
-# @profile
+#@profile
 def get_block(fn_prefix, caches, offset):
     """Open the cached block fileobj at the necessary file offset
 
@@ -102,8 +102,7 @@ def get_block(fn_prefix, caches, offset):
     cached_files = [
         fn
         for fs in caches.keys()
-        for fn in glob.glob(os.path.join(fs, f"{fn_prefix}.[0-9]*"))
-        if DELETE_STR not in fn
+        for fn in glob.glob(os.path.join(fs, f"{fn_prefix}.*[0-9]"))
     ]
 
     # Iterate through the cached files/offsets
@@ -122,7 +121,7 @@ def get_block(fn_prefix, caches, offset):
     return None, None
 
 
-# @profile
+#@profile
 def cached_read(f, nbytes, fn_prefix, caches, cf_, fidx):
     """Read necessary bytes from cached blocks. If remainder of data is not in cache, read from original
     location.
@@ -185,11 +184,11 @@ def cached_read(f, nbytes, fn_prefix, caches, cf_, fidx):
 
             # update global offset
             offset = cf_.tell() + fidx[0]
+            f.seek(offset, os.SEEK_SET)
         else:
             f.seek(offset, os.SEEK_SET)
             data += f.read(remainder_bytes)
             remainder_bytes = 0
-            is_cached = False
             cf_ = None
             fidx = None
 
@@ -200,6 +199,7 @@ def cached_read(f, nbytes, fn_prefix, caches, cf_, fidx):
 
     return data, cf_, fidx
 
+#@profile
 def pf_read(f, nbytes, fn_prefix, caches={}, cf_=None, fidx=None):
     """Determine whether to read bytes from cache or original file
 
@@ -232,7 +232,7 @@ def pf_read(f, nbytes, fn_prefix, caches={}, cf_=None, fidx=None):
         data, cf_, fidx = cached_read(f, nbytes, fn_prefix, caches, cf_, fidx)
     else:
         data = f.read(nbytes)
-        get_block(fn_prefix, caches, f.tell())
+        cf_, fidx = get_block(fn_prefix, caches, f.tell())
 
     return data, cf_, fidx
 
