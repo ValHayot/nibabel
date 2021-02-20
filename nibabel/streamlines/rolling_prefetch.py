@@ -184,7 +184,6 @@ def cached_read(f, nbytes, fn_prefix, caches, cf_, fidx):
 
             # update global offset
             offset = cf_.tell() + fidx[0]
-            f.seek(offset, os.SEEK_SET)
         else:
             f.seek(offset, os.SEEK_SET)
             data += f.read(remainder_bytes)
