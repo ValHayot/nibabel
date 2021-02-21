@@ -68,10 +68,6 @@ def create_main_file(s3):
 
     with fs.open(s3_path, 'wb') as f:
         f.write(data)
-    #conn = boto3.resource('s3')
-    #conn.create_bucket(Bucket=BUCKET_NAME)
-    #conn.Bucket(BUCKET_NAME).put_object(Key=fname, Body=data)
-
 
     return s3_path
 
@@ -83,35 +79,26 @@ def create_cached(create_main_file):
     # take a chunk and save it to tmpfs space
     f = open(fname, "rb")
 
-    cfname = os.path.join(CACHE_DIR, f"{fname}.0")
-    csize = int(CACHE_SIZE / 2)
+    csize = int(CACHE_SIZE / 4)
+    cfname_0 = os.path.join(CACHE_DIR, f"{fname}.0")
+    cfname_1 = os.path.join(CACHE_DIR, f"{fname}.{csize}")
 
-    with open(cfname, 'wb') as cf_:
+    with open(cfname_0, 'wb') as cf_:
+        cf_.write(f.read(csize))
+
+    with open(cfname_1, 'wb') as cf_:
         cf_.write(f.read(csize))
 
     f.seek(0, os.SEEK_SET)
 
-    cf_ = open(cfname, "rb")
+    cf_ = open(cfname_0, "rb")
 
-    return { "f": f, "nbytes": csize + 256, "fn_prefix": fname, "cf_": cf_, "fidx": (0, csize) }
-
-    cleanup([cfname])
+    return { "f": f, "nbytes": csize*2 + 256, "fn_prefix": fname, "cf_": cf_, "fidx": (0, csize) }
 
 
-def cleanup(cfnames=[]):
-    for c in cfnames:
-        os.unlink(c)
-
-    
-def test_cached_read(create_cached):
-
-    data, cf_, fidx = rp.cached_read(caches=CACHES, **create_cached)
-    create_cached["f"].seek(0, os.SEEK_SET)
-
-    assert(data == create_cached["f"].read(create_cached["nbytes"]))
-    assert(cf_ is None)
-    assert(fidx is None)
-    assert(os.path.exists(f"{create_cached['cf_'].name}{DELETE_STR}"))
+def cleanup(fn_prefix):
+    for c in Path(CACHE_DIR).glob(fn_prefix + "*"):
+        c.unlink()
 
 def test_prefetch(create_main_file):
     fname = create_main_file
@@ -132,4 +119,48 @@ def test_prefetch(create_main_file):
 
     rp.prefetch(fname, CACHES, block_size=CACHE_SIZE)
     assert(not os.path.exists(to_remove))
+    cleanup(f_bn)
     
+    
+def test_cached_read(create_cached):
+
+    data, cf_, fidx = rp.cached_read(caches=CACHES, **create_cached)
+    create_cached["f"].seek(0, os.SEEK_SET)
+
+    assert(data == create_cached["f"].read(create_cached["nbytes"]))
+    assert(cf_ is None)
+    assert(fidx is None)
+    assert(os.path.exists(f"{create_cached['cf_'].name}{DELETE_STR}"))
+
+    cleanup(create_cached["fn_prefix"])
+
+
+def test_pf_read_cached(create_cached):
+
+    data, cf_, fidx = rp.pf_read(caches=CACHES, **create_cached)
+    create_cached["f"].seek(0, os.SEEK_SET)
+
+    assert(data == create_cached["f"].read(create_cached["nbytes"]))
+    assert(cf_ is None)
+    assert(fidx is None)
+    assert(os.path.exists(f"{create_cached['cf_'].name}{DELETE_STR}"))
+
+    cleanup(create_cached["fn_prefix"])
+
+
+def test_pf_read_uncached(create_main_file):
+
+    fn_prefix = os.path.basename(create_main_file)
+    fs = s3fs.S3FileSystem()
+    nbytes=1024
+
+    with fs.open(create_main_file, 'rb') as f:
+        data, cf_, fidx = rp.pf_read(caches=CACHES, f=f, nbytes=1024, fn_prefix=fn_prefix)
+        f.seek(0, os.SEEK_SET)
+        assert(data == f.read(nbytes))
+
+    assert(cf_ is None)
+    assert(fidx is None)
+
+    cleanup(fn_prefix)
+
