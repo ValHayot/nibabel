@@ -74,8 +74,8 @@ def prefetch(
                 if total_bytes <= offset:
                     fetch = False
                     break
-    except:
-        pass
+    except Exception as e:
+        print(str(e))
 
 
 #@profile

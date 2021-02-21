@@ -16,34 +16,72 @@ CACHES = { CACHE_DIR : CACHE_SIZE }
 DELETE_STR = ".nibtodelete"
 BUCKET_NAME = "s3trk"
 
+port = 5555
+endpoint_uri = "http://127.0.0.1:%s/" % port
+
+# taken from s3fs tests https://github.com/dask/s3fs/blob/main/s3fs/tests/test_s3fs.py#L57
+@pytest.fixture()
+def s3_base():
+    # writable local S3 system
+    import shlex
+    import subprocess
+    import requests
+    import time
+
+    proc = subprocess.Popen(shlex.split("moto_server s3 -p %s" % port))
+
+    timeout = 5
+    while timeout > 0:
+        try:
+            r = requests.get(endpoint_uri)
+            if r.ok:
+                break
+        except:
+            pass
+        timeout -= 0.1
+        time.sleep(0.1)
+    yield
+    proc.terminate()
+    proc.wait()
+
+@pytest.fixture()
+def s3(s3_base):
+    from botocore.session import Session
+
+    # NB: we use the sync botocore client for setup
+    session = Session()
+    client = session.create_client("s3", endpoint_url=endpoint_uri)
+    client.create_bucket(Bucket=BUCKET_NAME)
+
+    yield
+
 @pytest.fixture
-@mock_s3
-def create_main_file():
+def create_main_file(s3):
     # create main file
     fname = "random.bin"
 
     # generate a random bytestring
     data = os.urandom(CACHE_SIZE)
 
-    conn = boto3.resource('s3')
-    conn.create_bucket(Bucket=BUCKET_NAME)
-    conn.Bucket(BUCKET_NAME).put_object(Key=fname, Body=data)
-
     s3_path = os.path.join(BUCKET_NAME, fname)
+    fs = s3fs.S3FileSystem()
+
+    with fs.open(s3_path, 'wb') as f:
+        f.write(data)
+    #conn = boto3.resource('s3')
+    #conn.create_bucket(Bucket=BUCKET_NAME)
+    #conn.Bucket(BUCKET_NAME).put_object(Key=fname, Body=data)
+
 
     return s3_path
 
 @pytest.fixture
-@mock_s3
 def create_cached(create_main_file):
 
     fname = os.path.basename(create_main_file)
 
     # take a chunk and save it to tmpfs space
     f = open(fname, "rb")
-
-    conn = boto3.resource('s3')
-    conn.create_bucket(Bucket=BUCKET_NAME)
 
     cfname = os.path.join(CACHE_DIR, f"{fname}.0")
     csize = int(CACHE_SIZE / 2)
@@ -84,12 +122,13 @@ def test_prefetch(create_main_file):
     f_bn = os.path.basename(fname)
 
     # test prefetching
-    cached_files = Path(CACHE_DIR).glob(os.path.basename(f_bn) + "*")
-    assert(len(list(cached_files)) == 2), cached_files
+    cached_files = Path(CACHE_DIR).glob("*")
+    cf = list(cached_files)
+    assert(len(cf) == 2)
 
     # file removal
     to_remove = os.path.join(CACHE_DIR, f"{f_bn}.1{DELETE_STR}")
-    os.rename(cached_files[0], to_remove)
+    os.rename(cf[0], to_remove)
 
     rp.prefetch(fname, CACHES, block_size=CACHE_SIZE)
     assert(not os.path.exists(to_remove))
