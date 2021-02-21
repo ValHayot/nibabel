@@ -114,7 +114,7 @@ def test_prefetch(create_main_file):
     fname = create_main_file
 
     bs = CACHE_SIZE / 2
-    rp.prefetch(fname, CACHES, block_size=bs)
+    rp.prefetch(fname, CACHES, prefetch_size=bs)
 
     f_bn = os.path.basename(fname)
 
@@ -127,7 +127,7 @@ def test_prefetch(create_main_file):
     to_remove = os.path.join(CACHE_DIR, f"{f_bn}.1{DELETE_STR}")
     os.rename(cf[0], to_remove)
 
-    rp.prefetch(fname, CACHES, block_size=CACHE_SIZE)
+    rp.prefetch(fname, CACHES, prefetch_size=CACHE_SIZE)
     assert not os.path.exists(to_remove)
     cleanup(f_bn)
 

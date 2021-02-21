@@ -99,7 +99,7 @@ class S3TrkFile(TrkFile):
 
     @classmethod
     #@profile
-    def load(cls, fileobj, lazy_load=False, caches={ "/dev/shm": 7*1024 }):
+    def load(cls, fileobj, lazy_load=False, caches={ "/dev/shm": 7*1024 }, prefetch_size=32*1024**2):
         """ Loads streamlines from a filename or file-like object.
 
         Parameters
@@ -128,7 +128,7 @@ class S3TrkFile(TrkFile):
         hdr = cls._read_header(fileobj)
 
         # create rolling prefetch thread
-        t = threading.Thread(target=prefetch, args=(fileobj.path, deepcopy(caches)))
+        t = threading.Thread(target=prefetch, args=(fileobj.path, deepcopy(caches), prefetch_size))
         t.start()
         # Find scalars and properties name
         data_per_point_slice = {}

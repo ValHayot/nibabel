@@ -15,7 +15,7 @@ DELETE_STR = ".nibtodelete"
 
 #@profile
 def prefetch(
-    filename, caches, block_size=32*1024**2, **s3_kwargs
+    filename, caches, prefetch_size=32*1024**2, **s3_kwargs
 ):
     """Concurrently fetch data from S3 in blocks and store in cache
 
@@ -25,7 +25,7 @@ def prefetch(
         S3 file to prefetch from
     caches : dict
         Dictionary containing cache paths as keys and available space (in MB) as values
-    block_size: int
+    prefetch_size: int
         Number of bytes to prefect at a time (default: 32MB)
     s3_kwargs: kwargs
         Keyword arguments to pass to s3fs object
@@ -55,9 +55,9 @@ def prefetch(
                 space *= 1024 ** 2  # convert to bytes from megabytes
                 avail_cache = min(disk_usage(path).free, space)
 
-                while avail_cache >= block_size and total_bytes > offset:
+                while avail_cache >= prefetch_size and total_bytes > offset:
 
-                    data = fs.read_block(filename, offset, block_size)
+                    data = fs.read_block(filename, offset, prefetch_size)
 
                     # only write to final path when data copy is complete
                     tmp_path = os.path.join(path, f".{fn_prefix}.{offset}.tmp")
@@ -67,7 +67,7 @@ def prefetch(
                         f.write(data)
 
                     os.rename(tmp_path, final_path)
-                    offset += block_size
+                    offset += prefetch_size
                     avail_cache = disk_usage(path).free - space
 
                 # if we have already read the entire file terminate prefetching
